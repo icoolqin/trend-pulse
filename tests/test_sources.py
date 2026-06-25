@@ -392,25 +392,38 @@ class TestNpmSource:
 
 
 class TestRedditSource:
-    def test_parse_posts(self):
+    # Reddit's JSON endpoints now 403; the source parses the public Atom feed.
+    _FEED = '''<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <author><name>/u/alice</name></author>
+        <category term="memes" label="r/memes"/>
+        <title>Cool Post</title>
+        <link rel="alternate" href="https://www.reddit.com/r/memes/comments/abc/cool_post/" />
+        <updated>2026-06-24T08:00:00+00:00</updated>
+        <content type="html">&lt;span&gt;&lt;a href=&quot;https://example.com/x&quot;&gt;[link]&lt;/a&gt;&lt;/span&gt;</content>
+      </entry>
+    </feed>'''
+
+    def test_parse_feed(self):
         from trend_pulse.sources.reddit import RedditSource
-        children = [
-            {"data": {"title": "Cool Post", "score": 5000, "permalink": "/r/test/cool", "created_utc": 1741600000, "subreddit": "test", "author": "u1", "num_comments": 50, "upvote_ratio": 0.95}},
-        ]
-        items = RedditSource()._parse_posts(children)
+        items = RedditSource()._parse_feed(self._FEED, 20)
         assert len(items) == 1
         assert items[0].keyword == "Cool Post"
-        assert items[0].score == 10.0  # 5000/500, capped at 100
+        assert items[0].url == "https://www.reddit.com/r/memes/comments/abc/cool_post/"
+        assert items[0].metadata["subreddit"] == "r/memes"
+        assert items[0].metadata["author"] == "alice"
+        assert items[0].metadata["outbound_url"] == "https://example.com/x"
+        assert items[0].score == 100.0  # rank 1 → top score
 
     def test_search(self):
         from trend_pulse.sources.reddit import RedditSource
-        resp = _json_resp({"data": {"children": [
-            {"data": {"title": "Search Result", "score": 100, "permalink": "/r/test/s", "created_utc": 1741600000, "subreddit": "test", "author": "u2", "num_comments": 5, "upvote_ratio": 0.9}},
-        ]}})
+        resp = _text_resp(self._FEED)
         client = _mock_client([resp])
         with patch("httpx.AsyncClient", return_value=client):
-            items = _run(RedditSource().search("test"))
+            items = _run(RedditSource().search("memes"))
         assert len(items) == 1
+        assert items[0].keyword == "Cool Post"
 
 
 # ═══════════════════════════════════════════════════════
@@ -548,16 +561,26 @@ class TestArXivSource:
 class TestProductHuntSource:
     def test_parse_html(self):
         from trend_pulse.sources.producthunt import ProductHuntSource
-        html = '''{"__typename":"Post","someField":"x","name":"Cool App","tagline":"Do things","slug":"cool-app","votesCount":500}'''
+        html = '''head"__typename":"Post","id":"1","name":"Cool App","tagline":"Do things","slug":"cool-app","votesCount":200,"commentsCount":10'''
         items = ProductHuntSource()._parse_html(html)
         assert len(items) == 1
         assert items[0].keyword == "Cool App"
-        assert items[0].score == 50.0  # 500/10
+        assert items[0].score == 40.0  # 200 votes / 5
         assert items[0].metadata["tagline"] == "Do things"
+        assert items[0].url == "https://www.producthunt.com/posts/cool-app"
+
+    def test_comments_fallback(self):
+        # Votes are hidden on the homepage payload → rank by comment volume.
+        from trend_pulse.sources.producthunt import ProductHuntSource
+        html = '''x"__typename":"Post","id":"2","name":"No Votes","slug":"no-votes","commentsCount":5'''
+        items = ProductHuntSource()._parse_html(html)
+        assert len(items) == 1
+        assert items[0].score == 8.0  # 5 comments * 8 / 5
+        assert items[0].traffic == "5 comments"
 
     def test_search(self):
         from trend_pulse.sources.producthunt import ProductHuntSource
-        html = '''{"__typename":"Post","x":"y","name":"Search Result","tagline":"Found it","slug":"search-result","votesCount":200}'''
+        html = '''x"__typename":"Post","id":"3","name":"Search Result","tagline":"Found it","slug":"search-result","votesCount":200'''
         resp = _text_resp(html)
         client = _mock_client([resp])
         with patch("httpx.AsyncClient", return_value=client):

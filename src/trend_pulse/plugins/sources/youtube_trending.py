@@ -1,7 +1,12 @@
-"""YouTube Trending via InnerTube API (free, no auth required).
+"""YouTube Trending videos.
 
-Uses YouTube's internal API endpoint that the web frontend also uses.
-Returns trending videos with view counts and engagement data.
+Primary: the official **YouTube Data API v3** ``videos.list?chart=mostPopular``
+(free; needs a Google API key in ``YOUTUBE_API_KEY``). This is the only reliable
+free path since Google deprecated the public ``/feed/trending`` page in 2025 —
+scraping it now yields an empty ``richGridRenderer`` with zero videos.
+
+Fallback (best-effort, usually empty now): scrape ``ytInitialData`` / InnerTube.
+Get a free key at https://console.cloud.google.com → enable "YouTube Data API v3".
 """
 
 from __future__ import annotations
@@ -18,56 +23,96 @@ from ...sources.base import TrendItem
 
 class YouTubeTrendingSource(PluginSource):
     name = "youtube_trending"
-    description = "YouTube Trending - top trending videos worldwide or by region"
-    requires_auth = False
-    rate_limit = "reasonable (internal API)"
+    description = "YouTube Trending - most popular videos by region (official Data API; set YOUTUBE_API_KEY)"
+    requires_auth = False  # works without a key via fallback, but the key makes it reliable
+    rate_limit = "10k quota units/day (Data API free tier)"
     category = "global"
     frequency = "daily"
 
+    DATA_API_URL = "https://www.googleapis.com/youtube/v3/videos"
     INNERTUBE_URL = "https://www.youtube.com/youtubei/v1/browse"
-    # Read from env var; fallback is YouTube's well-known public web client key
     INNERTUBE_KEY = os.environ.get("YOUTUBE_INNERTUBE_KEY", "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8")
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Content-Type": "application/json",
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-    }
-
-    _GEO_MAP = {
-        "TW": "TW", "US": "US", "JP": "JP", "KR": "KR",
-        "HK": "HK", "SG": "SG", "": "US",
-    }
-
     PAGE_URL = "https://www.youtube.com/feed/trending"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
+    }
+
+    # Data API accepts ISO 3166-1 alpha-2 region codes directly.
+    _VALID_REGION = re.compile(r"^[A-Z]{2}$")
+
+    def _region(self, geo: str) -> str:
+        region = (geo or "US").upper()
+        return region if self._VALID_REGION.match(region) else "US"
 
     async def fetch_trending(self, geo: str = "", count: int = 20) -> list[TrendItem]:
-        region = self._GEO_MAP.get(geo.upper(), geo.upper() or "US")
+        region = self._region(geo)
 
-        # Try HTML page scraping (ytInitialData embedded in page)
+        api_key = os.environ.get("YOUTUBE_API_KEY", "")
+        if api_key:
+            try:
+                return await self._fetch_data_api(region, count, api_key)
+            except Exception:
+                pass  # fall through to best-effort scraping
+
+        # Best-effort fallbacks (often empty since trending was deprecated).
         try:
             return await self._fetch_html(region, count)
         except Exception:
             pass
-
-        # Try InnerTube API as fallback
         try:
             return await self._fetch_innertube(region, count)
         except Exception:
             return []
 
-    async def _fetch_html(self, region: str, count: int) -> list[TrendItem]:
-        """Scrape YouTube trending page for ytInitialData."""
-        params = {}
-        if region and region != "US":
-            params["gl"] = region
+    async def _fetch_data_api(self, region: str, count: int, api_key: str) -> list[TrendItem]:
+        params = {
+            "part": "snippet,statistics",
+            "chart": "mostPopular",
+            "regionCode": region,
+            "maxResults": max(1, min(count, 50)),
+            "key": api_key,
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(self.DATA_API_URL, params=params)
+            resp.raise_for_status()
+            data = resp.json()
 
+        items: list[TrendItem] = []
+        for entry in data.get("items", []):
+            snippet = entry.get("snippet", {})
+            stats = entry.get("statistics", {})
+            title = snippet.get("title", "")
+            if not title:
+                continue
+            video_id = entry.get("id", "")
+            views = int(stats.get("viewCount", 0) or 0)
+            items.append(TrendItem(
+                keyword=title,
+                score=min(views / 1_000_000, 100),  # 100M views = 100
+                source=self.name,
+                url=f"https://youtube.com/watch?v={video_id}",
+                traffic=f"{views:,} views" if views else "",
+                category="video",
+                published=snippet.get("publishedAt", ""),
+                metadata={
+                    "video_id": video_id,
+                    "channel": snippet.get("channelTitle", ""),
+                    "views": views,
+                    "likes": int(stats.get("likeCount", 0) or 0),
+                },
+            ))
+        return items
+
+    async def _fetch_html(self, region: str, count: int) -> list[TrendItem]:
+        params = {"gl": region} if region != "US" else {}
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             resp = await client.get(self.PAGE_URL, params=params, headers=self.HEADERS)
             resp.raise_for_status()
             html = resp.text
 
-        # Extract ytInitialData JSON using JSONDecoder — avoids catastrophic backtracking
-        # that `re.DOTALL` + `.*?` would cause on a 500KB+ HTML page.
         for marker in ("var ytInitialData = ", "ytInitialData = "):
             idx = html.find(marker)
             if idx != -1:
@@ -81,19 +126,17 @@ class YouTubeTrendingSource(PluginSource):
         return []
 
     async def _fetch_innertube(self, region: str, count: int) -> list[TrendItem]:
-        """Try the InnerTube internal API."""
         payload = {
             "browseId": "FEtrending",
             "context": {
                 "client": {
                     "clientName": "WEB",
                     "clientVersion": "2.20240101",
-                    "hl": "zh-TW" if region in ("TW", "HK") else "en",
+                    "hl": "en",
                     "gl": region,
                 },
             },
         }
-
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             resp = await client.post(
                 self.INNERTUBE_URL,
@@ -103,93 +146,59 @@ class YouTubeTrendingSource(PluginSource):
             )
             resp.raise_for_status()
             data = resp.json()
-
         return self._parse(data, count)
 
     def _parse(self, data: dict, count: int) -> list[TrendItem]:
+        """Walk the ytInitialData tree collecting any videoRenderer items."""
         items: list[TrendItem] = []
 
-        # Navigate InnerTube response structure
-        try:
-            tabs = data["contents"]["twoColumnBrowseResultsRenderer"]["tabs"]
-        except (KeyError, TypeError):
-            return items
+        def walk(node):
+            if len(items) >= count:
+                return
+            if isinstance(node, dict):
+                vr = node.get("videoRenderer")
+                if isinstance(vr, dict):
+                    self._append_video(vr, items)
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
 
-        for tab in tabs:
-            tab_renderer = tab.get("tabRenderer", {})
-            if not tab_renderer.get("selected", False):
-                # Try first tab if none selected
-                if not tabs or tab != tabs[0]:
-                    continue
+        walk(data)
+        return items[:count]
 
-            try:
-                sections = (
-                    tab_renderer["content"]["sectionListRenderer"]["contents"]
-                )
-            except (KeyError, TypeError):
-                continue
-
-            for section in sections:
-                item_section = section.get("itemSectionRenderer", {})
-                contents = item_section.get("contents", [])
-
-                for content in contents:
-                    shelf = content.get("shelfRenderer", {})
-                    shelf_contents = (
-                        shelf.get("content", {})
-                        .get("expandedShelfContentsRenderer", {})
-                        .get("items", [])
-                    )
-
-                    for video_item in shelf_contents:
-                        vr = video_item.get("videoRenderer", {})
-                        if not vr:
-                            continue
-
-                        video_id = vr.get("videoId", "")
-                        title_runs = vr.get("title", {}).get("runs", [])
-                        title = "".join(r.get("text", "") for r in title_runs)
-                        if not title:
-                            continue
-
-                        view_text = (
-                            vr.get("viewCountText", {}).get("simpleText", "")
-                            or vr.get("viewCountText", {}).get("runs", [{}])[0].get("text", "")
-                        )
-                        views = self._parse_views(view_text)
-
-                        channel_runs = vr.get("ownerText", {}).get("runs", [{}])
-                        channel = channel_runs[0].get("text", "") if channel_runs else ""
-
-                        items.append(TrendItem(
-                            keyword=title,
-                            score=min(views / 1_000_000, 100),  # 100M views = 100
-                            source=self.name,
-                            url=f"https://youtube.com/watch?v={video_id}",
-                            traffic=view_text,
-                            category="video",
-                            metadata={
-                                "video_id": video_id,
-                                "channel": channel,
-                                "views": views,
-                            },
-                        ))
-
-                        if len(items) >= count:
-                            return items
-
-        return items
+    def _append_video(self, vr: dict, items: list[TrendItem]) -> None:
+        video_id = vr.get("videoId", "")
+        title = "".join(r.get("text", "") for r in vr.get("title", {}).get("runs", []))
+        if not title:
+            return
+        view_text = (
+            vr.get("viewCountText", {}).get("simpleText", "")
+            or vr.get("viewCountText", {}).get("runs", [{}])[0].get("text", "")
+        )
+        views = self._parse_views(view_text)
+        channel_runs = vr.get("ownerText", {}).get("runs", [{}])
+        channel = channel_runs[0].get("text", "") if channel_runs else ""
+        items.append(TrendItem(
+            keyword=title,
+            score=min(views / 1_000_000, 100),
+            source=self.name,
+            url=f"https://youtube.com/watch?v={video_id}",
+            traffic=view_text,
+            category="video",
+            metadata={"video_id": video_id, "channel": channel, "views": views},
+        ))
 
     @staticmethod
     def _parse_views(text: str) -> float:
-        """Parse view count string like '1.2M views', '500K views'."""
         text = text.replace(",", "").replace(" views", "").replace("次觀看", "").strip()
         try:
             if "M" in text or "百萬" in text:
                 return float(re.sub(r"[^0-9.]", "", text)) * 1_000_000
-            elif "K" in text or "千" in text:
+            if "K" in text or "千" in text:
                 return float(re.sub(r"[^0-9.]", "", text)) * 1_000
-            elif text:
+            if text:
                 return float(re.sub(r"[^0-9.]", "", text))
         except ValueError:
             pass

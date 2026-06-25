@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trend Pulse CLI"
+  short_description: "Run and evaluate Trend Pulse sources"
+  default_prompt: "Use $trend-pulse-cli to fetch daily Western-market trend candidates and summarize source health."
